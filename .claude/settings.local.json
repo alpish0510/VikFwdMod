@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import winpty; p = winpty.PTY\\(80,24\\); print\\([m for m in dir\\(p\\) if not m.startswith\\(''_''\\)]\\)\")",
+      "Bash(python -c \"import winpty; help\\(winpty.PTY.read\\)\")",
+      "Bash(python -c \"import winpty; help\\(winpty.PTY.write\\); help\\(winpty.PTY.set_size\\)\")"
+    ]
+  }
+}

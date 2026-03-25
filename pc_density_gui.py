@@ -306,6 +306,180 @@ class RunnerThread(QThread):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  PTY BRIDGE  (Python ↔ xterm.js via QWebChannel)
+# ─────────────────────────────────────────────────────────────────────────────
+class PtyBridge(QObject):
+    """Exposes PTY I/O to JavaScript through QWebChannel."""
+    data_ready = pyqtSignal(str)   # PTY output → JS
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pty  = None
+        self._running = False
+
+    def start(self, cols: int = 120, rows: int = 30):
+        try:
+            import winpty
+            # pywinpty 2.x: winpty.PTY(cols, rows)
+            self._pty = winpty.PTY(cols, rows)
+            self._pty.spawn("powershell.exe")
+        except Exception as e:
+            self.data_ready.emit(f"\r\n\x1b[31m[PTY error: {e}]\x1b[0m\r\n"
+                                 f"\x1b[33mInstall pywinpty:  pip install pywinpty\x1b[0m\r\n")
+            return
+        self._running = True
+        threading.Thread(target=self._read_loop, daemon=True).start()
+
+    def _read_loop(self):
+        import time
+        while self._running and self._pty:
+            try:
+                data = self._pty.read(blocking=False)
+                if data:
+                    self.data_ready.emit(data)
+                else:
+                    time.sleep(0.01)
+            except Exception:
+                break
+        self._running = False
+
+    @pyqtSlot(str)
+    def send_input(self, data: str):
+        if self._pty and self._running:
+            try:
+                self._pty.write(data)
+            except Exception:
+                pass
+
+    @pyqtSlot(int, int)
+    def resize_pty(self, cols: int, rows: int):
+        if self._pty and self._running:
+            try:
+                self._pty.set_size(cols, rows)
+            except Exception:
+                pass
+
+    def stop(self):
+        self._running = False
+        if self._pty:
+            try:
+                self._pty.close()
+            except Exception:
+                pass
+            self._pty = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  TERMINAL WIDGET  (xterm.js inside QWebEngineView)
+# ─────────────────────────────────────────────────────────────────────────────
+_TERMINAL_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; background:#0e1117; overflow:hidden; }
+#terminal { width:100%; height:100%; }
+</style>
+<link rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+</head>
+<body>
+<div id="terminal"></div>
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script>
+var term = new Terminal({
+  fontFamily: "'JetBrains Mono','Fira Code',monospace",
+  fontSize: 13,
+  theme: {
+    background: '#0e1117', foreground: '#e2e8f0',
+    cursor: '#4f9eff', selectionBackground: '#1e3a5f',
+    black:'#0e1117', brightBlack:'#6b7a99',
+  },
+  cursorBlink: true,
+  allowProposedApi: true,
+});
+var fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.open(document.getElementById('terminal'));
+
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  var bridge = channel.objects.bridge;
+
+  bridge.data_ready.connect(function(data) {
+    term.write(data);
+  });
+
+  term.onData(function(data) {
+    bridge.send_input(data);
+  });
+
+  term.onResize(function(sz) {
+    bridge.resize_pty(sz.cols, sz.rows);
+  });
+
+  fitAddon.fit();
+});
+
+window.addEventListener('resize', function() {
+  if (typeof fitAddon !== 'undefined') fitAddon.fit();
+});
+</script>
+</body>
+</html>
+"""
+
+
+class TerminalWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        if not _WEBENGINE_OK:
+            msg = QLabel(
+                "Embedded terminal requires additional packages.\n\n"
+                "  pip install PyQt6-WebEngine pywinpty\n\n"
+                "Restart the GUI after installing."
+            )
+            msg.setStyleSheet(
+                f"color:{DARK['warning']}; padding:20px; font-size:13px;"
+            )
+            msg.setAlignment(Qt.AlignmentFlag.AlignTop)
+            lay.addWidget(msg)
+            self._ok = False
+            return
+
+        self._bridge = PtyBridge(self)
+        self._channel = QWebChannel(self)
+        self._channel.registerObject("bridge", self._bridge)
+
+        self._view = QWebEngineView(self)
+        self._view.page().setWebChannel(self._channel)
+        self._view.setHtml(_TERMINAL_HTML, QUrl("about:blank"))
+        self._view.loadFinished.connect(self._on_loaded)
+
+        lay.addWidget(self._view)
+        self._ok = True
+
+    def _on_loaded(self, ok: bool):
+        if ok and self._ok:
+            self._bridge.start()
+
+    def inject(self, text: str):
+        """Type text (+ Enter) into the terminal as if the user typed it."""
+        if self._ok:
+            self._bridge.send_input(text + "\r")
+
+    def stop(self):
+        if self._ok:
+            self._bridge.stop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 def _label(text, hint=None):
@@ -684,21 +858,27 @@ class DensityGUI(QMainWindow):
         self.validation_lbl.setObjectName("status_ok")
         lay.addWidget(self.validation_lbl)
 
-        # Console
-        con_lbl = QLabel("CONSOLE OUTPUT")
-        con_lbl.setObjectName("section_label")
-        lay.addWidget(con_lbl)
+        # Tab widget: Terminal | Script Output
+        self.output_tabs = QTabWidget()
+        self.output_tabs.setDocumentMode(True)
 
+        # ── Terminal tab ──────────────────────────────────────────────────
+        self.terminal = TerminalWidget()
+        self.output_tabs.addTab(self.terminal, "Terminal")
+
+        # ── Script output tab ─────────────────────────────────────────────
         self.console = QTextEdit()
         self.console.setObjectName("console")
         self.console.setReadOnly(True)
-        lay.addWidget(self.console, stretch=1)
+        self.output_tabs.addTab(self.console, "Script Output")
+
+        lay.addWidget(self.output_tabs, stretch=1)
 
         # Controls bar
         ctrl = QHBoxLayout()
         ctrl.setSpacing(8)
 
-        self.run_btn = QPushButton("▶  RUN")
+        self.run_btn = QPushButton("▶  RUN locally")
         self.run_btn.setObjectName("run_btn")
         self.run_btn.clicked.connect(self._run)
 
@@ -707,10 +887,14 @@ class DensityGUI(QMainWindow):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self._stop)
 
+        inject_btn = QPushButton("⌨  Inject to Terminal")
+        inject_btn.setToolTip("Type the built command into the terminal (useful after ssh)")
+        inject_btn.clicked.connect(self._inject_to_terminal)
+
         copy_btn = QPushButton("Copy command")
         copy_btn.clicked.connect(self._copy_cmd)
 
-        clear_btn = QPushButton("Clear console")
+        clear_btn = QPushButton("Clear output")
         clear_btn.clicked.connect(self.console.clear)
 
         self.status_lbl = QLabel("idle")
@@ -718,6 +902,7 @@ class DensityGUI(QMainWindow):
 
         ctrl.addWidget(self.run_btn)
         ctrl.addWidget(self.stop_btn)
+        ctrl.addWidget(inject_btn)
         ctrl.addWidget(copy_btn)
         ctrl.addWidget(clear_btn)
         ctrl.addStretch()
@@ -1002,6 +1187,14 @@ class DensityGUI(QMainWindow):
         self.status_lbl.style().unpolish(self.status_lbl)
         self.status_lbl.style().polish(self.status_lbl)
 
+    # ── INJECT TO TERMINAL ────────────────────────────────────────────────────
+    def _inject_to_terminal(self):
+        if not self._validate():
+            return
+        cmd = " ".join(shlex.quote(c) for c in self._build_cmd())
+        self.terminal.inject(cmd)
+        self.output_tabs.setCurrentIndex(0)   # switch to Terminal tab
+
     # ── COPY ─────────────────────────────────────────────────────────────────
     def _copy_cmd(self):
         cmd = " ".join(shlex.quote(c) for c in self._build_cmd())
@@ -1125,6 +1318,7 @@ class DensityGUI(QMainWindow):
         if self._runner and self._runner.isRunning():
             self._runner.stop()
             self._runner.wait(2000)
+        self.terminal.stop()
         super().closeEvent(e)
 
 
