@@ -9,26 +9,32 @@ A PyQt6 graphical launcher for `parametric_density.py`, a script that forward-mo
 | Package | Purpose |
 |---|---|
 | `PyQt6` | GUI framework |
-| `PyQt6-WebEngine` | Embedded terminal tab |
-| `pywinpty` | Windows PTY (needed for the terminal) |
+| `PyQt6-WebEngine` | Embedded terminal tabs |
+| `pywinpty` | Windows PTY — **Windows only**, not needed on Linux/macOS |
 
-Install everything at once:
-
+**Windows:**
 ```bash
 pip install PyQt6 PyQt6-WebEngine pywinpty
 ```
 
-> **Note:** `PyQt6-WebEngine` is ~100 MB. If you only need the local runner and command builder, you can skip it. The GUI will show a fallback message in the Terminal tab but everything else still works.
+**Linux / macOS:**
+```bash
+pip install PyQt6 PyQt6-WebEngine
+```
+
+The terminal uses the built-in Python `pty` module on Linux/macOS (no extra package required) and `pywinpty` on Windows. The shell opened is PowerShell on Windows and `$SHELL` (e.g. bash, zsh) on Unix.
+
+> **Note:** `PyQt6-WebEngine` is ~100 MB. If you skip it the GUI shows a fallback message in the terminal area but everything else still works.
 
 ---
 
 ## Usage
 
 ```bash
-python pc_density_gui.py
+python vikfwdmod.py
 ```
 
-Point the **Script** field to your copy of `parametric_density.py` (browse or type the path). The **Python** field defaults to `python3`, change it to match your environment (e.g. a conda env or a full path).
+Point the **Script** field to your copy of `parametric_density.py` (browse or type the path). The **Python** field defaults to `python3` — change it to match your environment (e.g. a conda env or a full path).
 
 ---
 
@@ -48,24 +54,18 @@ The window is split into two panels.
 | **Gaussian Priors** | Add Gaussian priors around the LSQ best-fit solution; configure rchi2 tolerance, prior scale, max fraction at boundary |
 | **Model Options** | Free background (`--fit-bkg`), full Vikhlinin model with second beta component (`--full-vikhlinin-em`), fix epsilon, fix named parameters after LSQ |
 
-### Right panel: Command and Output
+### Right panel: Command and Terminals
 
 **Command Preview** shows the full command line built from the current parameters. It is live and bidirectional: paste any valid `parametric_density.py` command into the box and all fields in the left panel will be auto-populated from it.
 
-**Output tabs:**
-
-- **Terminal** is a full interactive terminal (xterm.js + Windows ConPTY). Use it to `ssh` into a remote server, navigate to your data, and then use *Inject to Terminal* to fire the built command there.
-- **Script Output** is a read-only log of local subprocess runs, with colour-coded warnings, errors, and success lines.
+**Terminal tabs** provide one or more full interactive terminal sessions (xterm.js + PTY). Each tab runs an independent shell. Use the **＋** button in the top-right corner of the tab bar to open additional terminals. Tabs are closable — the last tab cannot be closed.
 
 **Control bar:**
 
 | Button | Action |
 |---|---|
-| **RUN locally** | Run the built command on this machine; output appears in the Script Output tab |
-| **STOP** | Kill the local process tree (Windows `taskkill /F /T`) |
-| **Inject to Terminal** | Type the built command into the Terminal tab and press Enter, useful after SSH-ing into a remote server |
+| **Put in terminal** | Insert the built command into the currently active terminal tab — without pressing Enter, so you can review or edit it first |
 | **Copy command** | Copy the full command string to the clipboard |
-| **Clear output** | Clear the Script Output tab |
 
 **Presets** let you save and reload named parameter configurations to `~/.pc_density_presets.json`. Useful for switching between clusters without re-entering everything.
 
@@ -74,20 +74,12 @@ The window is split into two panels.
 ## Typical remote-server workflow
 
 1. Open the GUI and fill in the cluster parameters.
-2. Switch to the **Terminal** tab. A PowerShell session opens automatically.
+2. A terminal tab opens automatically with a local shell.
 3. Run `ssh user@your-server` to log into the remote machine.
-4. Navigate to the directory that contains the data and `pc_parametric_density.py`.
-5. Click **Inject to Terminal**. The GUI types the full command into the terminal and presses Enter.
+4. Navigate to the directory that contains the data and `parametric_density.py`.
+5. Click **Put in terminal**. The command is inserted at the prompt without executing — review it, then press Enter when ready.
 6. Monitor the run directly in the terminal.
-
----
-
-## Typical local workflow
-
-1. Fill in parameters.
-2. Check the **Command Preview** and adjust if needed (edits sync back to the fields).
-3. Click **RUN locally**.
-4. Watch output in the **Script Output** tab.
+7. Open additional terminal tabs with **＋** for parallel sessions (e.g. a second SSH connection or a local shell alongside).
 
 ---
 

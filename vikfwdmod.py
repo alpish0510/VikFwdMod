@@ -7,7 +7,6 @@ Requires: PyQt6  →  pip install PyQt6
 import sys
 import os
 import json
-import subprocess
 import shlex
 import threading
 from pathlib import Path
@@ -19,8 +18,8 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QComboBox, QSizePolicy, QInputDialog,
     QTabWidget,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QProcess, QSize, QObject, pyqtSlot, QUrl
-from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor, QIcon, QSyntaxHighlighter, QTextCharFormat
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, pyqtSlot, QUrl
+from PyQt6.QtGui import QFont
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -253,84 +252,71 @@ class _DoubleSpinBox(QDoubleSpinBox):
         e.ignore()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PROCESS RUNNER THREAD
-# ─────────────────────────────────────────────────────────────────────────────
-class RunnerThread(QThread):
-    line_ready  = pyqtSignal(str, str)   # (text, kind)  kind: stdout|stderr|sys
-    finished    = pyqtSignal(int)        # exit code
-
-    def __init__(self, cmd):
-        super().__init__()
-        self.cmd  = cmd
-        self._proc = None
-
-    def run(self):
-        try:
-            env = os.environ.copy()
-            env["PYTHONUNBUFFERED"] = "1"
-            env["PYTHONIOENCODING"] = "utf-8"
-            self._proc = subprocess.Popen(
-                self.cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                env=env,
-            )
-            for line in iter(self._proc.stdout.readline, ""):
-                self.line_ready.emit(line.rstrip(), "stdout")
-            self._proc.stdout.close()
-            code = self._proc.wait()
-            self.finished.emit(code)
-        except Exception as e:
-            self.line_ready.emit(f"[GUI ERROR] {e}", "error")
-            self.finished.emit(-1)
-
-    def stop(self):
-        if not (self._proc and self._proc.poll() is None):
-            return
-        try:
-            # On Windows, terminate() only kills the top-level process.
-            # taskkill /F /T kills the entire process tree (including multiprocessing workers).
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(self._proc.pid)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            # Fallback for non-Windows or if taskkill is unavailable
-            self._proc.terminate()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PTY BRIDGE  (Python ↔ xterm.js via QWebChannel)
 # ─────────────────────────────────────────────────────────────────────────────
 class PtyBridge(QObject):
-    """Exposes PTY I/O to JavaScript through QWebChannel."""
-    data_ready = pyqtSignal(str)   # PTY output → JS
+    """Exposes PTY I/O to JavaScript through QWebChannel.
+
+    Windows : uses pywinpty + PowerShell
+    Linux/macOS : uses the built-in pty module + $SHELL
+    """
+    data_ready = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pty  = None
         self._running = False
+        # Windows
+        self._pty = None
+        # Unix
+        self._master_fd = None
+        self._proc = None
 
+    # ── start ─────────────────────────────────────────────────────────────
     def start(self, cols: int = 120, rows: int = 30):
+        if sys.platform == "win32":
+            self._start_windows(cols, rows)
+        else:
+            self._start_unix(cols, rows)
+
+    def _start_windows(self, cols, rows):
         try:
             import winpty
-            # pywinpty 2.x: winpty.PTY(cols, rows)
             self._pty = winpty.PTY(cols, rows)
             self._pty.spawn("powershell.exe")
         except Exception as e:
-            self.data_ready.emit(f"\r\n\x1b[31m[PTY error: {e}]\x1b[0m\r\n"
-                                 f"\x1b[33mInstall pywinpty:  pip install pywinpty\x1b[0m\r\n")
+            self.data_ready.emit(
+                f"\r\n\x1b[31m[PTY error: {e}]\x1b[0m\r\n"
+                f"\x1b[33mInstall pywinpty:  pip install pywinpty\x1b[0m\r\n"
+            )
             return
         self._running = True
-        threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._read_loop_windows, daemon=True).start()
 
-    def _read_loop(self):
+    def _start_unix(self, cols, rows):
+        import pty, subprocess, fcntl, termios, struct
+        shell = os.environ.get("SHELL", "/bin/bash")
+        try:
+            self._master_fd, slave_fd = pty.openpty()
+            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ,
+                        struct.pack("HHHH", rows, cols, 0, 0))
+            self._proc = subprocess.Popen(
+                [shell],
+                stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+                close_fds=True,
+            )
+            os.close(slave_fd)
+        except Exception as e:
+            self.data_ready.emit(
+                f"\r\n\x1b[31m[PTY error: {e}]\x1b[0m\r\n"
+            )
+            return
+        self._running = True
+        threading.Thread(target=self._read_loop_unix, daemon=True).start()
+
+    # ── read loops ────────────────────────────────────────────────────────
+    def _read_loop_windows(self):
         import time
         while self._running and self._pty:
             try:
@@ -343,22 +329,47 @@ class PtyBridge(QObject):
                 break
         self._running = False
 
+    def _read_loop_unix(self):
+        import select
+        while self._running and self._master_fd is not None:
+            try:
+                r, _, _ = select.select([self._master_fd], [], [], 0.1)
+                if r:
+                    data = os.read(self._master_fd, 4096)
+                    if data:
+                        self.data_ready.emit(data.decode("utf-8", errors="replace"))
+                    else:
+                        break
+            except OSError:
+                break
+        self._running = False
+
+    # ── input / resize ────────────────────────────────────────────────────
     @pyqtSlot(str)
     def send_input(self, data: str):
-        if self._pty and self._running:
-            try:
+        if not self._running:
+            return
+        try:
+            if self._pty is not None:
                 self._pty.write(data)
-            except Exception:
-                pass
+            elif self._master_fd is not None:
+                os.write(self._master_fd, data.encode("utf-8"))
+        except Exception:
+            pass
 
     @pyqtSlot(int, int)
     def resize_pty(self, cols: int, rows: int):
-        if self._pty and self._running:
-            try:
+        try:
+            if self._pty is not None and self._running:
                 self._pty.set_size(cols, rows)
-            except Exception:
-                pass
+            elif self._master_fd is not None:
+                import fcntl, termios, struct
+                fcntl.ioctl(self._master_fd, termios.TIOCSWINSZ,
+                            struct.pack("HHHH", rows, cols, 0, 0))
+        except Exception:
+            pass
 
+    # ── cleanup ───────────────────────────────────────────────────────────
     def stop(self):
         self._running = False
         if self._pty:
@@ -367,6 +378,18 @@ class PtyBridge(QObject):
             except Exception:
                 pass
             self._pty = None
+        if self._master_fd is not None:
+            try:
+                os.close(self._master_fd)
+            except Exception:
+                pass
+            self._master_fd = None
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            self._proc = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +497,11 @@ class TerminalWidget(QWidget):
         if self._ok:
             self._bridge.send_input(text + "\r")
 
+    def put_text(self, text: str):
+        """Place text into the terminal input line without pressing Enter."""
+        if self._ok:
+            self._bridge.send_input(text)
+
     def stop(self):
         if self._ok:
             self._bridge.stop()
@@ -507,7 +535,6 @@ class DensityGUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("pc_parametric_density — MCMC launcher")
         self.setMinimumSize(1180, 780)
-        self._runner: RunnerThread | None = None
         self._updating_preview = False
         self._build_ui()
         self._load_presets_file()
@@ -858,56 +885,82 @@ class DensityGUI(QMainWindow):
         self.validation_lbl.setObjectName("status_ok")
         lay.addWidget(self.validation_lbl)
 
-        # Tab widget: Terminal | Script Output
-        self.output_tabs = QTabWidget()
-        self.output_tabs.setDocumentMode(True)
+        # ── Terminal tabs ─────────────────────────────────────────────────
+        self.terminal_tabs = QTabWidget()
+        self.terminal_tabs.setDocumentMode(True)
+        self.terminal_tabs.setTabsClosable(True)
+        self.terminal_tabs.tabCloseRequested.connect(self._close_terminal_tab)
 
-        # ── Terminal tab ──────────────────────────────────────────────────
-        self.terminal = TerminalWidget()
-        self.output_tabs.addTab(self.terminal, "Terminal")
+        add_tab_btn = QPushButton("＋")
+        add_tab_btn.setFixedSize(28, 28)
+        add_tab_btn.setToolTip("Open a new terminal tab")
+        add_tab_btn.setFont(QFont("JetBrains Mono", 14, QFont.Weight.Light))
+        add_tab_btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background: transparent;"
+            f"  border: 1px solid {DARK['border']};"
+            f"  border-radius: 6px;"
+            f"  color: {DARK['text_dim']};"
+            f"  padding: 0;"
+            f"}}"
+            f"QPushButton:hover {{"
+            f"  background: {DARK['highlight']};"
+            f"  border-color: {DARK['accent']};"
+            f"  color: {DARK['accent']};"
+            f"}}"
+            f"QPushButton:pressed {{"
+            f"  background: {DARK['accent']};"
+            f"  color: #fff;"
+            f"}}"
+        )
+        add_tab_btn.clicked.connect(self._add_terminal_tab)
 
-        # ── Script output tab ─────────────────────────────────────────────
-        self.console = QTextEdit()
-        self.console.setObjectName("console")
-        self.console.setReadOnly(True)
-        self.output_tabs.addTab(self.console, "Script Output")
+        corner_wrap = QWidget()
+        corner_lay = QHBoxLayout(corner_wrap)
+        corner_lay.setContentsMargins(0, 2, 6, 0)
+        corner_lay.addWidget(add_tab_btn)
+        self.terminal_tabs.setCornerWidget(corner_wrap, Qt.Corner.TopRightCorner)
 
-        lay.addWidget(self.output_tabs, stretch=1)
+        self._add_terminal_tab()   # first terminal
+
+        lay.addWidget(self.terminal_tabs, stretch=1)
 
         # Controls bar
         ctrl = QHBoxLayout()
         ctrl.setSpacing(8)
 
-        self.run_btn = QPushButton("▶  RUN locally")
-        self.run_btn.setObjectName("run_btn")
-        self.run_btn.clicked.connect(self._run)
-
-        self.stop_btn = QPushButton("■  STOP")
-        self.stop_btn.setObjectName("stop_btn")
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self._stop)
-
-        inject_btn = QPushButton("⌨  Inject to Terminal")
-        inject_btn.setToolTip("Type the built command into the terminal (useful after ssh)")
-        inject_btn.clicked.connect(self._inject_to_terminal)
+        put_btn = QPushButton("⌨  Put in terminal")
+        put_btn.setToolTip("Insert the built command into the active terminal (without executing)")
+        put_btn.clicked.connect(self._put_in_terminal)
 
         copy_btn = QPushButton("Copy command")
         copy_btn.clicked.connect(self._copy_cmd)
 
-        clear_btn = QPushButton("Clear output")
-        clear_btn.clicked.connect(self.console.clear)
-
-        self.status_lbl = QLabel("idle")
+        self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("status_ok")
 
-        ctrl.addWidget(self.run_btn)
-        ctrl.addWidget(self.stop_btn)
-        ctrl.addWidget(inject_btn)
+        ctrl.addWidget(put_btn)
         ctrl.addWidget(copy_btn)
-        ctrl.addWidget(clear_btn)
         ctrl.addStretch()
         ctrl.addWidget(self.status_lbl)
         lay.addLayout(ctrl)
+
+    def _add_terminal_tab(self):
+        term = TerminalWidget()
+        idx = self.terminal_tabs.addTab(term, f"Terminal {self.terminal_tabs.count() + 1}")
+        self.terminal_tabs.setCurrentIndex(idx)
+
+    def _close_terminal_tab(self, idx: int):
+        if self.terminal_tabs.count() <= 1:
+            return   # always keep at least one terminal
+        widget = self.terminal_tabs.widget(idx)
+        if isinstance(widget, TerminalWidget):
+            widget.stop()
+        self.terminal_tabs.removeTab(idx)
+
+    def _current_terminal(self) -> "TerminalWidget | None":
+        w = self.terminal_tabs.currentWidget()
+        return w if isinstance(w, TerminalWidget) else None
 
     # ── COMMAND BUILDER ──────────────────────────────────────────────────────
     def _build_cmd(self):
@@ -1115,85 +1168,21 @@ class DensityGUI(QMainWindow):
         if errors:
             self.validation_lbl.setObjectName("status_err")
             self.validation_lbl.setText("⚠  " + "   ·   ".join(errors))
-            self.run_btn.setEnabled(False)
         else:
             self.validation_lbl.setObjectName("status_ok")
             self.validation_lbl.setText("✓  ready")
-            self.run_btn.setEnabled(True)
 
         # force style refresh
         self.validation_lbl.style().unpolish(self.validation_lbl)
         self.validation_lbl.style().polish(self.validation_lbl)
         return not errors
 
-    # ── RUN / STOP ────────────────────────────────────────────────────────────
-    def _run(self):
-        if not self._validate():
-            return
-        cmd = self._build_cmd()
-        self.console.clear()
-        self._log(f"$ {' '.join(shlex.quote(c) for c in cmd)}\n", "#6b7a99")
-        self._runner = RunnerThread(cmd)
-        self._runner.line_ready.connect(self._on_line)
-        self._runner.finished.connect(self._on_finished)
-        self._runner.start()
-        self.run_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        self.status_lbl.setObjectName("status_run")
-        self.status_lbl.setText("● running…")
-        self._refresh_status()
-
-    def _stop(self):
-        if self._runner:
-            self._runner.stop()
-
-    def _on_line(self, text: str, kind: str):
-        colour = DARK["text"]
-        if "error" in text.lower() or "traceback" in text.lower():
-            colour = DARK["error"]
-        elif "warning" in text.lower():
-            colour = DARK["warning"]
-        elif text.startswith("✓") or "saved" in text.lower():
-            colour = DARK["success"]
-        elif text.startswith("  RED_CHISQ") or "chi2" in text.lower():
-            colour = DARK["accent2"]
-        self._log(text, colour)
-
-    def _on_finished(self, code: int):
-        if code == 0:
-            self._log("\n✓ Process finished successfully.", DARK["success"])
-            self.status_lbl.setObjectName("status_ok")
-            self.status_lbl.setText(f"✓ done  (exit 0)")
-        else:
-            self._log(f"\n✗ Process exited with code {code}.", DARK["error"])
-            self.status_lbl.setObjectName("status_err")
-            self.status_lbl.setText(f"✗ exit {code}")
-        self._refresh_status()
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
-
-    def _log(self, text: str, colour: str = None):
-        cur = self.console.textCursor()
-        cur.movePosition(QTextCursor.MoveOperation.End)
-        fmt = QTextCharFormat()
-        if colour:
-            fmt.setForeground(QColor(colour))
-        cur.setCharFormat(fmt)
-        cur.insertText(text + "\n")
-        self.console.setTextCursor(cur)
-        self.console.ensureCursorVisible()
-
-    def _refresh_status(self):
-        self.status_lbl.style().unpolish(self.status_lbl)
-        self.status_lbl.style().polish(self.status_lbl)
-
-    # ── INJECT TO TERMINAL ────────────────────────────────────────────────────
-    def _inject_to_terminal(self):
-        if not self._validate():
-            return
+    # ── PUT IN TERMINAL ───────────────────────────────────────────────────────
+    def _put_in_terminal(self):
         cmd = " ".join(shlex.quote(c) for c in self._build_cmd())
-        self.terminal.inject(cmd)
-        self.output_tabs.setCurrentIndex(0)   # switch to Terminal tab
+        term = self._current_terminal()
+        if term:
+            term.put_text(cmd)
 
     # ── COPY ─────────────────────────────────────────────────────────────────
     def _copy_cmd(self):
@@ -1315,10 +1304,9 @@ class DensityGUI(QMainWindow):
             self._refresh_preset_combo()
 
     def closeEvent(self, e):
-        if self._runner and self._runner.isRunning():
-            self._runner.stop()
-            self._runner.wait(2000)
-        self.terminal.stop()
+        term = self._current_terminal()
+        if term:
+            term.stop()
         super().closeEvent(e)
 
 
