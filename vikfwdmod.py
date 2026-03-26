@@ -536,6 +536,8 @@ class DensityGUI(QMainWindow):
         self.setWindowTitle("pc_parametric_density — MCMC launcher")
         self.setMinimumSize(1180, 780)
         self._updating_preview = False
+        self._active_terminal: "TerminalWidget | None" = None
+        self._terminal_counter = 0
         self._build_ui()
         self._load_presets_file()
         self._update_preview()
@@ -890,6 +892,7 @@ class DensityGUI(QMainWindow):
         self.terminal_tabs.setDocumentMode(True)
         self.terminal_tabs.setTabsClosable(True)
         self.terminal_tabs.tabCloseRequested.connect(self._close_terminal_tab)
+        self.terminal_tabs.currentChanged.connect(self._on_tab_changed)
 
         add_tab_btn = QPushButton("＋")
         add_tab_btn.setFixedSize(28, 28)
@@ -946,9 +949,15 @@ class DensityGUI(QMainWindow):
         lay.addLayout(ctrl)
 
     def _add_terminal_tab(self):
+        # Save current state onto the active terminal before switching
+        if self._active_terminal is not None:
+            self._active_terminal._state = self._collect_state()
+
         term = TerminalWidget()
-        idx = self.terminal_tabs.addTab(term, f"Terminal {self.terminal_tabs.count() + 1}")
-        self.terminal_tabs.setCurrentIndex(idx)
+        term._state = self._collect_state()   # new tab inherits current parameters
+        self._terminal_counter += 1
+        idx = self.terminal_tabs.addTab(term, f"Terminal {self._terminal_counter}")
+        self.terminal_tabs.setCurrentIndex(idx)   # fires _on_tab_changed
 
     def _close_terminal_tab(self, idx: int):
         if self.terminal_tabs.count() <= 1:
@@ -961,6 +970,22 @@ class DensityGUI(QMainWindow):
     def _current_terminal(self) -> "TerminalWidget | None":
         w = self.terminal_tabs.currentWidget()
         return w if isinstance(w, TerminalWidget) else None
+
+    def _on_tab_changed(self, new_idx: int):
+        # Save current parameters to the terminal we're leaving
+        if self._active_terminal is not None:
+            self._active_terminal._state = self._collect_state()
+
+        # Restore parameters for the terminal we're switching to
+        new_term = self.terminal_tabs.widget(new_idx)
+        if isinstance(new_term, TerminalWidget):
+            self._active_terminal = new_term
+            self._updating_preview = True
+            try:
+                self._apply_state(new_term._state)
+            finally:
+                self._updating_preview = False
+            self._update_preview()
 
     # ── COMMAND BUILDER ──────────────────────────────────────────────────────
     def _build_cmd(self):
