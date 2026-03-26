@@ -10,7 +10,7 @@ A PyQt6 graphical launcher for `parametric_density.py`, a script that forward-mo
 |---|---|
 | `PyQt6` | GUI framework |
 | `PyQt6-WebEngine` | Embedded terminal tabs |
-| `pywinpty` | Windows PTY — **Windows only**, not needed on Linux/macOS |
+| `pywinpty` | Windows PTY - **Windows only**, not needed on Linux/macOS |
 
 **Windows:**
 ```bash
@@ -34,7 +34,7 @@ The terminal uses the built-in Python `pty` module on Linux/macOS (no extra pack
 python vikfwdmod.py
 ```
 
-Point the **Script** field to your copy of `parametric_density.py` (browse or type the path). The **Python** field defaults to `python3` — change it to match your environment (e.g. a conda env or a full path).
+Point the **Script** field to your copy of `parametric_density.py` (browse or type the path). The **Python** field defaults to `python3` - change it to match your environment (e.g. a conda env or a full path).
 
 ---
 
@@ -58,13 +58,13 @@ The window is split into two panels.
 
 **Command Preview** shows the full command line built from the current parameters. It is live and bidirectional: paste any valid `parametric_density.py` command into the box and all fields in the left panel will be auto-populated from it.
 
-**Terminal tabs** provide one or more full interactive terminal sessions (xterm.js + PTY). Each tab runs an independent shell. Use the **＋** button in the top-right corner of the tab bar to open additional terminals. Tabs are closable — the last tab cannot be closed.
+**Terminal tabs** provide one or more full interactive terminal sessions (xterm.js + PTY). Each tab runs an independent shell. Use the **＋** button in the top-right corner of the tab bar to open additional terminals. Tabs are closable but the last tab cannot be closed.
 
 **Control bar:**
 
 | Button | Action |
 |---|---|
-| **Put in terminal** | Insert the built command into the currently active terminal tab — without pressing Enter, so you can review or edit it first |
+| **Put in terminal** | Insert the built command into the currently active terminal tab without pressing Enter, so you can review or edit it first |
 | **Copy command** | Copy the full command string to the clipboard |
 
 **Presets** let you save and reload named parameter configurations to `~/.pc_density_presets.json`. Useful for switching between clusters without re-entering everything.
@@ -77,7 +77,7 @@ The window is split into two panels.
 2. A terminal tab opens automatically with a local shell.
 3. Run `ssh user@your-server` to log into the remote machine.
 4. Navigate to the directory that contains the data and `parametric_density.py`.
-5. Click **Put in terminal**. The command is inserted at the prompt without executing — review it, then press Enter when ready.
+5. Click **Put in terminal**. The command is inserted at the prompt without executing. Review it, then press Enter when ready.
 6. Monitor the run directly in the terminal.
 7. Open additional terminal tabs with **＋** for parallel sessions (e.g. a second SSH connection or a local shell alongside).
 
