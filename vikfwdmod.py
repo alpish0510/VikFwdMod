@@ -9,6 +9,7 @@ import os
 import json
 import shlex
 import threading
+import base64
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -18,8 +19,8 @@ from PyQt6.QtWidgets import (
     QSpinBox, QDoubleSpinBox, QComboBox, QSizePolicy, QInputDialog,
     QTabWidget, QDialog,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, pyqtSlot, QUrl
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, pyqtSlot, QUrl, QTimer
+from PyQt6.QtGui import QFont, QPixmap
 
 try:
     from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -44,6 +45,12 @@ try:
     _CORNER_OK = True
 except ImportError:
     _CORNER_OK = False
+
+try:
+    import paramiko as _paramiko
+    _PARAMIKO_OK = True
+except ImportError:
+    _PARAMIKO_OK = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,7 +274,6 @@ class _SpinBox(QSpinBox):
 class _DoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, e):
         e.ignore()
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -750,6 +756,204 @@ def _build_corner_figure_fullvik(samples, remove_params=None, remove_fixed=False
     return fig
 
 
+# ── Remote script template (runs on server, prints base64 JSON to stdout) ─────
+
+_REMOTE_DIAG_SCRIPT = r'''
+import sys, json, io, base64
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+_ALL_PARAM_NAMES = [
+    "$n_0$", "$r_c$/$r_{500}$", r"$\alpha$", r"$\beta$",
+    "$r_s$/$r_{500}$", r"$\epsilon$", "$bkg$",
+]
+
+def _ext(s):
+    return s if isinstance(s, np.ndarray) else np.asarray(s['samples'])
+
+def _has(s, k):
+    if isinstance(s, np.ndarray): return False
+    if hasattr(s, 'files'): return k in s.files
+    if isinstance(s, dict): return k in s
+    return False
+
+def _active(samp):
+    n = samp.shape[1]
+    labels = _ALL_PARAM_NAMES[:n]
+    cols = [i for i in range(n) if samp[:, i].std() > 0]
+    return samp[:, cols], [labels[i] for i in cols]
+
+def _keys_labels(ndim):
+    ks = ['n0','rc','alpha','beta','rs','eps','n02','rc2','beta2','bkg']
+    ls = ["$n_0$","$r_c$/$r_{500}$",r"$\alpha$",r"$\beta$","$r_s$/$r_{500}$",r"$\epsilon$",
+          '$n_{0,2}$','$r_{c,2}/r_{500}$',r'$\beta_2$','$bkg$']
+    if ndim <= len(ks): return ks[:ndim], ls[:ndim]
+    extra = [f'p{i}' for i in range(len(ks), ndim)]
+    return ks + extra, ls + extra
+
+def _alias(name):
+    a = {'n0':'n0','rc':'rc','rc_r500':'rc','alpha':'alpha','beta':'beta',
+         'rs':'rs','rs_r500':'rs','eps':'eps','epsilon':'eps',
+         'n02':'n02','rc2':'rc2','rc2_r500':'rc2','beta2':'beta2','bkg':'bkg','background':'bkg'}
+    return a.get(str(name).strip().lower(), str(name).strip().lower())
+
+def _clean(name):
+    return _alias(str(name).strip().lower().split('[')[0].strip().replace(' ',''))
+
+def _vec_from_map(mapping, keys):
+    try: return np.asarray([float(mapping[k]) for k in keys], dtype=float)
+    except KeyError: return None
+
+def _coerce(cand, keys):
+    if isinstance(cand, dict):
+        return _vec_from_map({_alias(k): v for k, v in cand.items()}, keys)
+    arr = np.asarray(cand)
+    if isinstance(arr, np.ndarray) and arr.dtype.names:
+        names = set(arr.dtype.names)
+        if {'param_name','best_fit'}.issubset(names):
+            m = {_clean(r['param_name']): float(r['best_fit']) for r in arr}
+            v = _vec_from_map(m, keys)
+            if v is not None: return v
+        if 'param_name' in names:
+            for c in ['value','val','x','lsq','best_fit']:
+                if c in names:
+                    m = {_clean(r['param_name']): float(r[c]) for r in arr}
+                    v = _vec_from_map(m, keys)
+                    if v is not None: return v
+        if set(keys).issubset(names):
+            return np.array([float(arr[k]) for k in keys], dtype=float).ravel()
+    try: return np.asarray(cand, dtype=float).ravel()
+    except: return None
+
+def _sampler_to_linear(vec, keys):
+    out = np.asarray(vec, dtype=float).copy()
+    for i, k in enumerate(keys[:out.size]):
+        if k in {'n0','rc','rs','n02','rc2'}: out[i] = 10**out[i]
+    return out
+
+def _lsq_vec(samples, ndim, keys):
+    cands = []
+    if _has(samples, 'lsq_params_linear'): cands.append(samples['lsq_params_linear'])
+    if _has(samples, 'lsq_params_sampler'):
+        sv = _coerce(samples['lsq_params_sampler'], keys)
+        if sv is not None: cands.append(_sampler_to_linear(sv, keys))
+    if _has(samples, 'best_fit'): cands.append(samples['best_fit'])
+    for raw in cands:
+        v = _coerce(raw, keys)
+        if v is None: continue
+        if v.size == ndim - 1:
+            v = np.concatenate([v, [np.median(_ext(samples)[:, -1])]])
+        if v.size == ndim and np.all(np.isfinite(v)): return v
+    return None
+
+def _keep(samp, keys, remove_params=None, remove_fixed=False):
+    rm = set()
+    if remove_params:
+        rn = remove_params.replace(',',' ').split() if isinstance(remove_params, str) else [str(x) for x in remove_params]
+        k2i = {k: i for i, k in enumerate(keys)}
+        for n in {_alias(x) for x in rn if str(x).strip()}:
+            if n in k2i: rm.add(k2i[n])
+    if remove_fixed:
+        rm.update(np.where(np.std(samp, axis=0) < 1e-12)[0].tolist())
+    keep = [i for i in range(samp.shape[1]) if i not in rm]
+    if not keep: raise ValueError('All parameters removed.')
+    return keep
+
+def chain_fig(samp_plot, names):
+    n = len(names)
+    fig = plt.figure(figsize=(10, max(6, 2*n)))
+    gs = fig.add_gridspec(n, 1, hspace=0)
+    for i in range(n):
+        ax = fig.add_subplot(gs[i])
+        ax.plot(samp_plot[:, i], color='steelblue', lw=0.4, alpha=0.7)
+        ax.set_ylabel(names[i], fontsize=9)
+        ax.yaxis.set_label_position('right'); ax.yaxis.tick_right()
+        if i < n-1: ax.set_xticklabels([])
+        else: ax.set_xlabel("Sample index")
+    return fig
+
+def corner_fig_fullvik(samples, remove_params, remove_fixed):
+    import corner
+    samp = _ext(samples); ndim = samp.shape[1]
+    keys, labels = _keys_labels(ndim)
+    ki = _keep(samp, keys, remove_params, remove_fixed)
+    fig = corner.corner(samp[:, ki], labels=[labels[i] for i in ki],
+        show_titles=True, title_fmt=".4f", levels=(0.68,0.95),
+        bins=20, no_fill_contours=True, color='blue', smooth=1.5,
+        data_kwargs={"alpha":0.01})
+    lv = _lsq_vec(samples, ndim, keys)
+    if lv is not None:
+        lp = lv[ki]
+        corner.overplot_lines(fig, lp, color='black', linestyle=':', linewidth=1.3)
+        corner.overplot_points(fig, lp[None,:], marker='o', color='black')
+    return fig
+
+def corner_fig_std(samples):
+    import corner
+    samp, labels = _active(_ext(samples).copy())
+    return corner.corner(samp, labels=labels, show_titles=True, title_fmt=".4f",
+        levels=(0.68,0.95), bins=20, no_fill_contours=True,
+        color='blue', smooth=1.5, data_kwargs={"alpha":0.01})
+
+def to_b64(fig, dpi=120):
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def main():
+    file_path    = FILE_PATH
+    fullvik      = FULLVIK
+    remove_params = REMOVE_PARAMS
+    remove_fixed  = REMOVE_FIXED
+
+    samples = np.load(file_path, allow_pickle=True)
+    out = {}
+
+    try:
+        samp = _ext(samples)
+        if fullvik:
+            keys, names = _keys_labels(samp.shape[1])
+            ki = _keep(samp, keys, remove_params, remove_fixed)
+            fig = chain_fig(samp[:, ki], [names[i] for i in ki])
+        else:
+            sp, nm = _active(samp.copy())
+            fig = chain_fig(sp, nm)
+        out['chain'] = to_b64(fig)
+    except Exception as e:
+        out['chain_error'] = str(e)
+
+    try:
+        if fullvik:
+            fig = corner_fig_fullvik(samples, remove_params, remove_fixed)
+        else:
+            fig = corner_fig_std(samples)
+        out['corner'] = to_b64(fig, dpi=150)
+    except ImportError:
+        out['corner_error'] = 'corner not installed on server'
+    except Exception as e:
+        out['corner_error'] = str(e)
+
+    sys.stdout.write(json.dumps(out))
+    sys.stdout.flush()
+
+main()
+'''
+
+
+def _build_remote_script(file_path: str, fullvik: bool, remove_params, remove_fixed: bool) -> str:
+    rp_repr = repr(remove_params)
+    return (
+        _REMOTE_DIAG_SCRIPT
+        .replace('FILE_PATH',     repr(file_path))
+        .replace('FULLVIK',       str(fullvik))
+        .replace('REMOVE_PARAMS', rp_repr)
+        .replace('REMOVE_FIXED',  str(remove_fixed))
+    )
+
+
 # ── Dialog window ─────────────────────────────────────────────────────────────
 
 class MCMCDiagnosticsWindow(QDialog):
@@ -758,6 +962,7 @@ class MCMCDiagnosticsWindow(QDialog):
         self.setWindowTitle("MCMC Diagnostics")
         self.setMinimumSize(950, 720)
         self._samples = None
+        self._gen_btn = None
         self._build_ui()
 
     def _build_ui(self):
@@ -765,27 +970,65 @@ class MCMCDiagnosticsWindow(QDialog):
         lay.setSpacing(10)
         lay.setContentsMargins(12, 12, 12, 12)
 
-        # ── File picker ───────────────────────────────────────────────────────
-        file_box = QGroupBox("Samples File")
-        file_lay = QHBoxLayout(file_box)
+        # ── Source section ────────────────────────────────────────────────────
+        src_box = QGroupBox("Samples File")
+        src_vlay = QVBoxLayout(src_box)
+
+        # Remote toggle row
+        remote_row = QHBoxLayout()
+        self._remote_cb = QCheckBox("Run on remote server (SSH)")
+        self._remote_cb.toggled.connect(self._on_remote_toggled)
+        remote_row.addWidget(self._remote_cb)
+        remote_row.addStretch()
+        src_vlay.addLayout(remote_row)
+
+        # Host + password row (hidden by default)
+        host_row = QHBoxLayout()
+        self._host_lbl = QLabel("user@host:")
+        self._host_lbl.setFixedWidth(72)
+        self._host_edit = QLineEdit()
+        self._host_edit.setPlaceholderText("e.g.  alice@myserver.edu")
+        pw_lbl = QLabel("Password:")
+        pw_lbl.setFixedWidth(68)
+        self._pw_edit = QLineEdit()
+        self._pw_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pw_edit.setPlaceholderText("leave blank to use SSH key")
+        self._pw_edit.setMaximumWidth(180)
+        host_row.addWidget(self._host_lbl)
+        host_row.addWidget(self._host_edit)
+        host_row.addWidget(pw_lbl)
+        host_row.addWidget(self._pw_edit)
+        self._host_row_widget = QWidget()
+        self._host_row_widget.setLayout(host_row)
+        self._host_row_widget.setVisible(False)
+        src_vlay.addWidget(self._host_row_widget)
+
+        # File path row
+        file_row = QHBoxLayout()
         self._file_edit = QLineEdit()
         self._file_edit.setPlaceholderText("Path to .npz samples file …")
-        browse_btn = QPushButton("Browse")
-        browse_btn.setFixedWidth(88)
-        browse_btn.clicked.connect(self._browse_file)
-        load_btn = QPushButton("Load")
-        load_btn.setFixedWidth(70)
-        load_btn.clicked.connect(self._load_file)
-        file_lay.addWidget(self._file_edit)
-        file_lay.addWidget(browse_btn)
-        file_lay.addWidget(load_btn)
-        lay.addWidget(file_box)
+        self._browse_btn = QPushButton("Browse")
+        self._browse_btn.setFixedWidth(88)
+        self._browse_btn.clicked.connect(self._browse_file)
+        self._load_btn = QPushButton("Load")
+        self._load_btn.setFixedWidth(70)
+        self._load_btn.clicked.connect(self._load_file)
+        file_row.addWidget(self._file_edit)
+        file_row.addWidget(self._browse_btn)
+        file_row.addWidget(self._load_btn)
+        src_vlay.addLayout(file_row)
+
+        self._src_hint = QLabel("Local mode: Browse and Load a file, then Generate.")
+        self._src_hint.setObjectName("hint")
+        src_vlay.addWidget(self._src_hint)
+
+        lay.addWidget(src_box)
 
         # ── Options ───────────────────────────────────────────────────────────
         opt_box = QGroupBox("Options")
         opt_lay = QHBoxLayout(opt_box)
-        self._fullvik_cb    = QCheckBox("Full Vikhlinin model")
-        self._rm_fixed_cb   = QCheckBox("Remove fixed params")
+        self._fullvik_cb  = QCheckBox("Full Vikhlinin model")
+        self._rm_fixed_cb = QCheckBox("Remove fixed params")
         opt_lay.addWidget(self._fullvik_cb)
         opt_lay.addWidget(self._rm_fixed_cb)
         opt_lay.addWidget(QLabel("Remove params:"))
@@ -794,10 +1037,10 @@ class MCMCDiagnosticsWindow(QDialog):
         self._rm_edit.setMaximumWidth(200)
         opt_lay.addWidget(self._rm_edit)
         opt_lay.addStretch()
-        gen_btn = QPushButton("Generate Plots")
-        gen_btn.setObjectName("run_btn")
-        gen_btn.clicked.connect(self._generate)
-        opt_lay.addWidget(gen_btn)
+        self._gen_btn = QPushButton("Generate Plots")
+        self._gen_btn.setObjectName("run_btn")
+        self._gen_btn.clicked.connect(self._generate)
+        opt_lay.addWidget(self._gen_btn)
         lay.addWidget(opt_box)
 
         # ── Status ────────────────────────────────────────────────────────────
@@ -825,7 +1068,22 @@ class MCMCDiagnosticsWindow(QDialog):
             err.setObjectName("status_err")
             lay.addWidget(err)
 
-    # ── slots ─────────────────────────────────────────────────────────────────
+    # ── remote toggle ─────────────────────────────────────────────────────────
+
+    def _on_remote_toggled(self, checked: bool):
+        self._host_row_widget.setVisible(checked)
+        self._browse_btn.setVisible(not checked)
+        self._load_btn.setVisible(not checked)
+        if checked:
+            self._file_edit.setPlaceholderText("Remote path, e.g.  /home/alice/results/cluster.npz")
+            self._src_hint.setText(
+                "Remote mode: enter user@host above and the full remote path below, then Generate."
+            )
+        else:
+            self._file_edit.setPlaceholderText("Path to .npz samples file …")
+            self._src_hint.setText("Local mode: Browse and Load a file, then Generate.")
+
+    # ── local file loading ────────────────────────────────────────────────────
 
     def _browse_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -850,6 +1108,8 @@ class MCMCDiagnosticsWindow(QDialog):
             self._set_status(f"Load error: {exc}", error=True)
             self._samples = None
 
+    # ── shared helpers ────────────────────────────────────────────────────────
+
     def _set_status(self, msg, error=False):
         self._status.setObjectName("status_err" if error else "status_ok")
         self._status.setText(msg)
@@ -873,47 +1133,150 @@ class MCMCDiagnosticsWindow(QDialog):
         target_layout.addWidget(scroll)
         canvas.draw()
 
+    def _embed_png_bytes(self, png_bytes: bytes, target_layout):
+        self._clear_layout(target_layout)
+        pixmap = QPixmap()
+        pixmap.loadFromData(png_bytes)
+        label = QLabel()
+        label.setPixmap(pixmap)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(label)
+        target_layout.addWidget(scroll)
+
+    # ── generate dispatcher ───────────────────────────────────────────────────
+
     def _generate(self):
         if not _MPL_OK:
             self._set_status("matplotlib not available.", error=True)
             return
+        if self._remote_cb.isChecked():
+            self._generate_remote()
+        else:
+            self._generate_local()
+
+    # ── local generation ──────────────────────────────────────────────────────
+
+    def _generate_local(self):
         if self._samples is None:
             self._set_status("Load a samples file first.", error=True)
             return
 
-        fullvik      = self._fullvik_cb.isChecked()
-        remove_fixed = self._rm_fixed_cb.isChecked()
+        fullvik       = self._fullvik_cb.isChecked()
+        remove_fixed  = self._rm_fixed_cb.isChecked()
         remove_params = self._rm_edit.text().strip() or None
 
         try:
             plt.close('all')
-
             if fullvik:
                 chain_fig = _build_chain_figure_fullvik(
-                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed
-                )
+                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed)
             else:
                 chain_fig = _build_chain_figure_standard(self._samples)
             self._embed_figure(chain_fig, self._chain_lay)
 
             if not _CORNER_OK:
-                self._set_status(
-                    "Chain plot done. corner not installed — pip install corner", error=True
-                )
+                self._set_status("Chain done. corner not installed — pip install corner", error=True)
                 self._tabs.setCurrentIndex(0)
                 return
 
             if fullvik:
                 corner_fig = _build_corner_figure_fullvik(
-                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed
-                )
+                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed)
             else:
                 corner_fig = _build_corner_figure_standard(self._samples)
             self._embed_figure(corner_fig, self._corner_lay)
-
             self._set_status("Done.", error=False)
         except Exception as exc:
             self._set_status(f"Error: {exc}", error=True)
+
+    # ── remote generation (SSH) ───────────────────────────────────────────────
+
+    def _generate_remote(self):
+        if not _PARAMIKO_OK:
+            self._set_status("paramiko not installed — pip install paramiko", error=True)
+            return
+
+        host_str    = self._host_edit.text().strip()
+        remote_path = self._file_edit.text().strip()
+        password    = self._pw_edit.text()   # empty string = try key auth
+
+        if not host_str:
+            self._set_status("Enter user@host.", error=True)
+            return
+        if not remote_path:
+            self._set_status("Enter the remote file path.", error=True)
+            return
+
+        # Parse user@host
+        if '@' in host_str:
+            username, hostname = host_str.split('@', 1)
+        else:
+            username, hostname = None, host_str
+
+        fullvik       = self._fullvik_cb.isChecked()
+        remove_fixed  = self._rm_fixed_cb.isChecked()
+        remove_params = self._rm_edit.text().strip() or None
+
+        script = _build_remote_script(remote_path, fullvik, remove_params, remove_fixed)
+        self._set_status("Running on server …", error=False)
+        self._gen_btn.setEnabled(False)
+
+        def worker():
+            client = _paramiko.SSHClient()
+            client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
+            try:
+                connect_kwargs = {'hostname': hostname}
+                if username:
+                    connect_kwargs['username'] = username
+                if password:
+                    connect_kwargs['password'] = password
+                client.connect(**connect_kwargs)
+
+                stdin, stdout, stderr = client.exec_command('python3 -')
+                stdin.write(script.encode())
+                stdin.channel.shutdown_write()
+
+                output    = stdout.read().decode()
+                err_text  = stderr.read().decode()
+                exit_code = stdout.channel.recv_exit_status()
+                client.close()
+
+                if exit_code != 0:
+                    raise RuntimeError(err_text.strip() or f"python3 exited with code {exit_code}")
+                return output.strip(), None
+            except Exception as exc:
+                client.close()
+                return None, str(exc)
+
+        def run():
+            stdout, err = worker()
+            QTimer.singleShot(0, lambda: self._on_remote_done(stdout, err))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_remote_done(self, stdout: str, err: str):
+        self._gen_btn.setEnabled(True)
+        if err:
+            self._set_status(f"SSH error: {err}", error=True)
+            return
+        try:
+            data = json.loads(stdout)
+        except Exception:
+            self._set_status("Could not parse server response.", error=True)
+            return
+
+        if 'chain' in data:
+            self._embed_png_bytes(base64.b64decode(data['chain']), self._chain_lay)
+        elif 'chain_error' in data:
+            self._set_status(f"Chain error: {data['chain_error']}", error=True)
+
+        if 'corner' in data:
+            self._embed_png_bytes(base64.b64decode(data['corner']), self._corner_lay)
+            self._set_status("Done.", error=False)
+        elif 'corner_error' in data:
+            self._set_status(f"Corner: {data['corner_error']}", error=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
