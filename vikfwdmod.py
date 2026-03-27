@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QGridLayout, QLabel, QLineEdit, QCheckBox, QPushButton, QScrollArea,
     QFrame, QSplitter, QTextEdit, QFileDialog, QMessageBox, QGroupBox,
     QSpinBox, QDoubleSpinBox, QComboBox, QSizePolicy, QInputDialog,
-    QTabWidget,
+    QTabWidget, QDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, pyqtSlot, QUrl
 from PyQt6.QtGui import QFont
@@ -27,6 +27,23 @@ try:
     _WEBENGINE_OK = True
 except ImportError:
     _WEBENGINE_OK = False
+
+try:
+    import numpy as np
+    import matplotlib
+    matplotlib.use('QtAgg')
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavToolbar
+    _MPL_OK = True
+except ImportError:
+    _MPL_OK = False
+
+try:
+    import corner as _corner_mod
+    _CORNER_OK = True
+except ImportError:
+    _CORNER_OK = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,6 +543,380 @@ def _hsep():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  MCMC DIAGNOSTICS  —  helpers + window
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ALL_PARAM_NAMES = [
+    "$n_0$", "$r_c$/$r_{500}$", r"$\alpha$", r"$\beta$",
+    "$r_s$/$r_{500}$", r"$\epsilon$", "$bkg$",
+]
+
+
+def _diag_extract_samples(samples):
+    if isinstance(samples, np.ndarray):
+        return samples
+    return np.asarray(samples['samples'])
+
+
+def _diag_npz_has_key(samples, key):
+    if isinstance(samples, np.ndarray):
+        return False
+    if hasattr(samples, 'files'):
+        return key in samples.files
+    if isinstance(samples, dict):
+        return key in samples
+    return False
+
+
+def _diag_get_active_params(samp):
+    n_orig = samp.shape[1]
+    labels = _ALL_PARAM_NAMES[:n_orig]
+    active_cols = [i for i in range(n_orig) if samp[:, i].std() > 0]
+    return samp[:, active_cols], [labels[i] for i in active_cols]
+
+
+def _diag_param_keys_labels(ndim):
+    all_keys   = ['n0','rc','alpha','beta','rs','eps','n02','rc2','beta2','bkg']
+    all_labels = [
+        "$n_0$", "$r_c$/$r_{500}$", r"$\alpha$", r"$\beta$",
+        "$r_s$/$r_{500}$", r"$\epsilon$",
+        '$n_{0,2}$', '$r_{c,2}/r_{500}$', r'$\beta_2$', '$bkg$',
+    ]
+    if ndim <= len(all_keys):
+        return all_keys[:ndim], all_labels[:ndim]
+    extra = [f'p{i}' for i in range(len(all_keys), ndim)]
+    return all_keys + extra, all_labels + extra
+
+
+def _diag_alias_to_canonical(name):
+    aliases = {
+        'n0':'n0','rc':'rc','rc_r500':'rc','alpha':'alpha','beta':'beta',
+        'rs':'rs','rs_r500':'rs','eps':'eps','epsilon':'eps',
+        'n02':'n02','rc2':'rc2','rc2_r500':'rc2','beta2':'beta2',
+        'bkg':'bkg','background':'bkg',
+    }
+    return aliases.get(str(name).strip().lower(), str(name).strip().lower())
+
+
+def _diag_clean_param_name(name):
+    base = str(name).strip().lower().split('[')[0].strip()
+    return _diag_alias_to_canonical(base.replace(' ', ''))
+
+
+def _diag_vector_from_mapping(mapping, param_keys):
+    vals = []
+    for key in param_keys:
+        if key not in mapping:
+            return None
+        vals.append(float(mapping[key]))
+    return np.asarray(vals, dtype=float)
+
+
+def _diag_coerce_param_vector(candidate, param_keys):
+    if isinstance(candidate, dict):
+        canonical = {_diag_alias_to_canonical(k): v for k, v in candidate.items()}
+        return _diag_vector_from_mapping(canonical, param_keys)
+    arr_obj = np.asarray(candidate, dtype=object)
+    if arr_obj.ndim == 0 and arr_obj.dtype == object:
+        return _diag_coerce_param_vector(arr_obj.item(), param_keys)
+    arr = np.asarray(candidate)
+    if isinstance(arr, np.ndarray) and arr.dtype.names:
+        names = set(arr.dtype.names)
+        if {'param_name', 'best_fit'}.issubset(names):
+            mapping = {_diag_clean_param_name(r['param_name']): float(r['best_fit']) for r in arr}
+            vec = _diag_vector_from_mapping(mapping, param_keys)
+            if vec is not None:
+                return vec
+        if 'param_name' in names:
+            for cand in ['value', 'val', 'x', 'lsq', 'best_fit']:
+                if cand in names:
+                    mapping = {_diag_clean_param_name(r['param_name']): float(r[cand]) for r in arr}
+                    vec = _diag_vector_from_mapping(mapping, param_keys)
+                    if vec is not None:
+                        return vec
+        if set(param_keys).issubset(names):
+            return np.array([float(arr[k]) for k in param_keys], dtype=float).ravel()
+    try:
+        return np.asarray(candidate, dtype=float).ravel()
+    except Exception:
+        return None
+
+
+def _diag_convert_sampler_to_linear(vec, param_keys):
+    out = np.asarray(vec, dtype=float).copy()
+    for i, key in enumerate(param_keys[:out.size]):
+        if key in {'n0', 'rc', 'rs', 'n02', 'rc2'}:
+            out[i] = 10 ** out[i]
+    return out
+
+
+def _diag_get_lsq_vector(samples, ndim, param_keys, lsq_key='lsq_params_linear', use_best_fit_fallback=True):
+    candidates = []
+    if _diag_npz_has_key(samples, lsq_key):
+        candidates.append((f"NPZ '{lsq_key}'", samples[lsq_key]))
+    if _diag_npz_has_key(samples, 'lsq_params_sampler'):
+        sv = _diag_coerce_param_vector(samples['lsq_params_sampler'], param_keys)
+        if sv is not None:
+            candidates.append(("lsq_params_sampler (converted)", _diag_convert_sampler_to_linear(sv, param_keys)))
+    if use_best_fit_fallback and _diag_npz_has_key(samples, 'best_fit'):
+        candidates.append(("best_fit", samples['best_fit']))
+    for _, raw in candidates:
+        vec = _diag_coerce_param_vector(raw, param_keys)
+        if vec is None:
+            continue
+        if vec.size == ndim - 1:
+            vec = np.concatenate([vec, [np.median(_diag_extract_samples(samples)[:, -1])]])
+        if vec.size == ndim and np.all(np.isfinite(vec)):
+            return vec
+    return None
+
+
+def _diag_resolve_keep_indices(samp, param_keys, remove_params=None, remove_fixed=False, fixed_tol=1e-12):
+    ndim = samp.shape[1]
+    remove_idx = set()
+    if remove_params:
+        raw_names = remove_params.replace(',', ' ').split() if isinstance(remove_params, str) else [str(x) for x in remove_params]
+        requested = {_diag_alias_to_canonical(n) for n in raw_names if str(n).strip()}
+        key_to_idx = {k: i for i, k in enumerate(param_keys)}
+        for n in requested:
+            if n in key_to_idx:
+                remove_idx.add(key_to_idx[n])
+    if remove_fixed:
+        remove_idx.update(np.where(np.std(samp, axis=0) < fixed_tol)[0].tolist())
+    keep_idx = [i for i in range(ndim) if i not in remove_idx]
+    if not keep_idx:
+        raise ValueError('All parameters were removed from the plot.')
+    return keep_idx
+
+
+# ── Figure builders (return Figure objects, do not call plt.show) ─────────────
+
+def _build_chain_fig(samp_plot, names_plot):
+    n = len(names_plot)
+    fig = plt.figure(figsize=(10, max(6, 2 * n)))
+    gs = fig.add_gridspec(n, 1, hspace=0)
+    for i in range(n):
+        ax = fig.add_subplot(gs[i])
+        ax.plot(samp_plot[:, i], color='steelblue', lw=0.4, alpha=0.7, rasterized=False)
+        ax.set_ylabel(names_plot[i], fontsize=9)
+        ax.yaxis.set_label_position('right')
+        ax.yaxis.tick_right()
+        if i < n - 1:
+            ax.set_xticklabels([])
+        else:
+            ax.set_xlabel("Sample index")
+    return fig
+
+
+def _build_chain_figure_standard(samples):
+    samp, param_names = _diag_get_active_params(_diag_extract_samples(samples).copy())
+    return _build_chain_fig(samp, param_names)
+
+
+def _build_chain_figure_fullvik(samples, remove_params=None, remove_fixed=False):
+    samp = _diag_extract_samples(samples)
+    param_keys, param_names = _diag_param_keys_labels(samp.shape[1])
+    keep_idx = _diag_resolve_keep_indices(samp, param_keys, remove_params=remove_params, remove_fixed=remove_fixed)
+    return _build_chain_fig(samp[:, keep_idx], [param_names[i] for i in keep_idx])
+
+
+def _build_corner_figure_standard(samples):
+    samp, labels = _diag_get_active_params(_diag_extract_samples(samples).copy())
+    fig = _corner_mod.corner(
+        samp, labels=labels, show_titles=True, title_fmt=".4f",
+        levels=(0.68, 0.95), bins=20, no_fill_contours=True,
+        color='blue', smooth=1.5, data_kwargs={"alpha": 0.01},
+    )
+    return fig
+
+
+def _build_corner_figure_fullvik(samples, remove_params=None, remove_fixed=False):
+    samp = _diag_extract_samples(samples)
+    ndim = samp.shape[1]
+    param_keys, labels = _diag_param_keys_labels(ndim)
+    keep_idx = _diag_resolve_keep_indices(samp, param_keys, remove_params=remove_params, remove_fixed=remove_fixed)
+    samp_plot = samp[:, keep_idx]
+    labels_plot = [labels[i] for i in keep_idx]
+    fig = _corner_mod.corner(
+        samp_plot, labels=labels_plot, show_titles=True, title_fmt=".4f",
+        levels=(0.68, 0.95), bins=20, no_fill_contours=True,
+        color='blue', smooth=1.5, data_kwargs={"alpha": 0.01},
+    )
+    lsq_vec = _diag_get_lsq_vector(samples, ndim, param_keys)
+    if lsq_vec is not None:
+        lsq_vec_plot = lsq_vec[keep_idx]
+        _corner_mod.overplot_lines(fig, lsq_vec_plot, color='black', linestyle=':', linewidth=1.3)
+        _corner_mod.overplot_points(fig, lsq_vec_plot[None, :], marker='o', color='black')
+    return fig
+
+
+# ── Dialog window ─────────────────────────────────────────────────────────────
+
+class MCMCDiagnosticsWindow(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MCMC Diagnostics")
+        self.setMinimumSize(950, 720)
+        self._samples = None
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setSpacing(10)
+        lay.setContentsMargins(12, 12, 12, 12)
+
+        # ── File picker ───────────────────────────────────────────────────────
+        file_box = QGroupBox("Samples File")
+        file_lay = QHBoxLayout(file_box)
+        self._file_edit = QLineEdit()
+        self._file_edit.setPlaceholderText("Path to .npz samples file …")
+        browse_btn = QPushButton("Browse")
+        browse_btn.setFixedWidth(88)
+        browse_btn.clicked.connect(self._browse_file)
+        load_btn = QPushButton("Load")
+        load_btn.setFixedWidth(70)
+        load_btn.clicked.connect(self._load_file)
+        file_lay.addWidget(self._file_edit)
+        file_lay.addWidget(browse_btn)
+        file_lay.addWidget(load_btn)
+        lay.addWidget(file_box)
+
+        # ── Options ───────────────────────────────────────────────────────────
+        opt_box = QGroupBox("Options")
+        opt_lay = QHBoxLayout(opt_box)
+        self._fullvik_cb    = QCheckBox("Full Vikhlinin model")
+        self._rm_fixed_cb   = QCheckBox("Remove fixed params")
+        opt_lay.addWidget(self._fullvik_cb)
+        opt_lay.addWidget(self._rm_fixed_cb)
+        opt_lay.addWidget(QLabel("Remove params:"))
+        self._rm_edit = QLineEdit()
+        self._rm_edit.setPlaceholderText("e.g. bkg, eps")
+        self._rm_edit.setMaximumWidth(200)
+        opt_lay.addWidget(self._rm_edit)
+        opt_lay.addStretch()
+        gen_btn = QPushButton("Generate Plots")
+        gen_btn.setObjectName("run_btn")
+        gen_btn.clicked.connect(self._generate)
+        opt_lay.addWidget(gen_btn)
+        lay.addWidget(opt_box)
+
+        # ── Status ────────────────────────────────────────────────────────────
+        self._status = QLabel("")
+        self._status.setObjectName("status_ok")
+        lay.addWidget(self._status)
+
+        # ── Plot tabs ─────────────────────────────────────────────────────────
+        if _MPL_OK:
+            self._tabs = QTabWidget()
+
+            self._chain_wrap = QWidget()
+            self._chain_lay  = QVBoxLayout(self._chain_wrap)
+            self._chain_lay.setContentsMargins(0, 0, 0, 0)
+            self._tabs.addTab(self._chain_wrap, "Chain")
+
+            self._corner_wrap = QWidget()
+            self._corner_lay  = QVBoxLayout(self._corner_wrap)
+            self._corner_lay.setContentsMargins(0, 0, 0, 0)
+            self._tabs.addTab(self._corner_wrap, "Corner")
+
+            lay.addWidget(self._tabs, stretch=1)
+        else:
+            err = QLabel("matplotlib not available — pip install matplotlib")
+            err.setObjectName("status_err")
+            lay.addWidget(err)
+
+    # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select samples file", "", "NumPy (*.npz *.npy);;All (*)"
+        )
+        if path:
+            self._file_edit.setText(path)
+
+    def _load_file(self):
+        path = self._file_edit.text().strip()
+        if not path:
+            self._set_status("No file selected.", error=True)
+            return
+        if not Path(path).exists():
+            self._set_status("File not found.", error=True)
+            return
+        try:
+            self._samples = np.load(path, allow_pickle=True)
+            n = _diag_extract_samples(self._samples).shape[0]
+            self._set_status(f"Loaded — {n:,} samples.", error=False)
+        except Exception as exc:
+            self._set_status(f"Load error: {exc}", error=True)
+            self._samples = None
+
+    def _set_status(self, msg, error=False):
+        self._status.setObjectName("status_err" if error else "status_ok")
+        self._status.setText(msg)
+        self._status.style().unpolish(self._status)
+        self._status.style().polish(self._status)
+
+    def _clear_layout(self, layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _embed_figure(self, fig, target_layout):
+        self._clear_layout(target_layout)
+        canvas = FigureCanvas(fig)
+        toolbar = NavToolbar(canvas, self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(canvas)
+        target_layout.addWidget(toolbar)
+        target_layout.addWidget(scroll)
+        canvas.draw()
+
+    def _generate(self):
+        if not _MPL_OK:
+            self._set_status("matplotlib not available.", error=True)
+            return
+        if self._samples is None:
+            self._set_status("Load a samples file first.", error=True)
+            return
+
+        fullvik      = self._fullvik_cb.isChecked()
+        remove_fixed = self._rm_fixed_cb.isChecked()
+        remove_params = self._rm_edit.text().strip() or None
+
+        try:
+            plt.close('all')
+
+            if fullvik:
+                chain_fig = _build_chain_figure_fullvik(
+                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed
+                )
+            else:
+                chain_fig = _build_chain_figure_standard(self._samples)
+            self._embed_figure(chain_fig, self._chain_lay)
+
+            if not _CORNER_OK:
+                self._set_status(
+                    "Chain plot done. corner not installed — pip install corner", error=True
+                )
+                self._tabs.setCurrentIndex(0)
+                return
+
+            if fullvik:
+                corner_fig = _build_corner_figure_fullvik(
+                    self._samples, remove_params=remove_params, remove_fixed=remove_fixed
+                )
+            else:
+                corner_fig = _build_corner_figure_standard(self._samples)
+            self._embed_figure(corner_fig, self._corner_lay)
+
+            self._set_status("Done.", error=False)
+        except Exception as exc:
+            self._set_status(f"Error: {exc}", error=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  MAIN WINDOW
 # ─────────────────────────────────────────────────────────────────────────────
 class DensityGUI(QMainWindow):
@@ -939,11 +1330,16 @@ class DensityGUI(QMainWindow):
         copy_btn = QPushButton("Copy command")
         copy_btn.clicked.connect(self._copy_cmd)
 
+        diag_btn = QPushButton("📊  Diagnostics…")
+        diag_btn.setToolTip("Open MCMC diagnostics plots (chain & corner) from a saved .npz file")
+        diag_btn.clicked.connect(self._open_diagnostics)
+
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("status_ok")
 
         ctrl.addWidget(put_btn)
         ctrl.addWidget(copy_btn)
+        ctrl.addWidget(diag_btn)
         ctrl.addStretch()
         ctrl.addWidget(self.status_lbl)
         lay.addLayout(ctrl)
@@ -1327,6 +1723,17 @@ class DensityGUI(QMainWindow):
             del self._presets[name]
             self.PRESETS_FILE.write_text(json.dumps(self._presets, indent=2))
             self._refresh_preset_combo()
+
+    # ── DIAGNOSTICS ──────────────────────────────────────────────────────────
+    def _open_diagnostics(self):
+        if not _MPL_OK:
+            QMessageBox.warning(
+                self, "Missing dependency",
+                "matplotlib is required for diagnostics.\n\npip install matplotlib"
+            )
+            return
+        dlg = MCMCDiagnosticsWindow(self)
+        dlg.show()
 
     def closeEvent(self, e):
         term = self._current_terminal()
