@@ -5,6 +5,7 @@ Requires: PyQt6  →  pip install PyQt6
 """
 
 import sys
+print(sys.executable)
 import os
 import json
 import shlex
