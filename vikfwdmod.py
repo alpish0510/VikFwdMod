@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-GUI launcher for pc_parametric_density.py
+GUI launcher for parametric_density.py
 Requires: PyQt6  →  pip install PyQt6
 """
 
 import sys
-print(sys.executable)
 import os
 import json
 import shlex
