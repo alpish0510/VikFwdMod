@@ -1557,6 +1557,30 @@ class DensityGUI(QMainWindow):
             self._prior_sub.extend([ll, w])
 
         self._toggle_prior_sub()
+
+        # ── Ghirardini+2019 priors (independent of --gaussian-prior) ──
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine); sep.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(sep, 4, 0, 1, 2)
+
+        self.eps_prior_nsigma = _DoubleSpinBox()
+        self.eps_prior_nsigma.setDecimals(2); self.eps_prior_nsigma.setRange(0.1, 10.0); self.eps_prior_nsigma.setValue(1.0)
+        self.eps_prior_nsigma.setToolTip("Width multiplier on N(2.86, 0.38) Ghirardini+2019 eps prior (always active)")
+        self.eps_prior_nsigma.valueChanged.connect(self._update_preview)
+        eps_lbl = _label("eps prior n×σ (Ghirardini+2019)")
+        lay.addWidget(eps_lbl,              5, 0)
+        lay.addWidget(self.eps_prior_nsigma, 5, 1)
+
+        self.rs_prior_nsigma_cb = QCheckBox("--rs-prior-nsigma  (log₁₀(rs/r500) prior)")
+        self.rs_prior_nsigma_cb.setToolTip("Apply N(−0.29, 0.15) Ghirardini+2019 prior on log₁₀(rs/r500)")
+        self.rs_prior_nsigma    = _DoubleSpinBox()
+        self.rs_prior_nsigma.setDecimals(2); self.rs_prior_nsigma.setRange(0.1, 10.0); self.rs_prior_nsigma.setValue(1.0)
+        self.rs_prior_nsigma.setEnabled(False)
+        self.rs_prior_nsigma_cb.stateChanged.connect(self._update_preview)
+        self.rs_prior_nsigma_cb.stateChanged.connect(lambda s: self.rs_prior_nsigma.setEnabled(bool(s)))
+        self.rs_prior_nsigma.valueChanged.connect(self._update_preview)
+        lay.addWidget(self.rs_prior_nsigma_cb, 6, 0)
+        lay.addWidget(self.rs_prior_nsigma,    6, 1)
+
         return box
 
     def _toggle_prior_sub(self):
@@ -1572,8 +1596,10 @@ class DensityGUI(QMainWindow):
 
         self.fit_bkg          = QCheckBox("--fit-bkg  (background as free parameter)")
         self.full_vikhlinin   = QCheckBox("--full-vikhlinin-em  (second β component)")
+        self.psf_corr         = QCheckBox("--psf-corr  (Churazov+2023 analytical PSF)")
         self.fit_bkg.stateChanged.connect(self._update_preview)
         self.full_vikhlinin.stateChanged.connect(self._update_preview)
+        self.psf_corr.stateChanged.connect(self._update_preview)
 
         self.fix_eps = _DoubleSpinBox()
         self.fix_eps.setDecimals(4); self.fix_eps.setRange(-1e6, 1e6); self.fix_eps.setValue(0)
@@ -1589,10 +1615,11 @@ class DensityGUI(QMainWindow):
 
         lay.addWidget(self.fit_bkg,        0, 0, 1, 2)
         lay.addWidget(self.full_vikhlinin, 1, 0, 1, 2)
-        lay.addWidget(self.fix_eps_cb,     2, 0)
-        lay.addWidget(self.fix_eps,        2, 1)
-        lay.addWidget(_label("fix-after-lsq"), 3, 0)
-        lay.addWidget(self.fix_after_lsq,  3, 1)
+        lay.addWidget(self.psf_corr,       2, 0, 1, 2)
+        lay.addWidget(self.fix_eps_cb,     3, 0)
+        lay.addWidget(self.fix_eps,        3, 1)
+        lay.addWidget(_label("fix-after-lsq"), 4, 0)
+        lay.addWidget(self.fix_after_lsq,  4, 1)
         return box
 
     # ── Preset bar ──
@@ -1775,6 +1802,8 @@ class DensityGUI(QMainWindow):
             add("--fit-bkg")
         if self.full_vikhlinin.isChecked():
             add("--full-vikhlinin-em")
+        if self.psf_corr.isChecked():
+            add("--psf-corr")
 
         if self.lsq_init.isChecked():
             add("--lsq-init")
@@ -1804,6 +1833,12 @@ class DensityGUI(QMainWindow):
         fix_str = self.fix_after_lsq.text().strip()
         if fix_str:
             add("--fix-after-lsq", fix_str)
+
+        eps_nsigma = self.eps_prior_nsigma.value()
+        if abs(eps_nsigma - 1.0) > 1e-9:
+            add("--eps-prior-nsigma", f"{eps_nsigma:.2f}")
+        if self.rs_prior_nsigma_cb.isChecked():
+            add("--rs-prior-nsigma", f"{self.rs_prior_nsigma.value():.2f}")
 
         return cmd
 
@@ -1896,6 +1931,7 @@ class DensityGUI(QMainWindow):
             # Model options
             self.fit_bkg.setChecked(checked("--fit-bkg"))
             self.full_vikhlinin.setChecked(checked("--full-vikhlinin-em"))
+            self.psf_corr.setChecked(checked("--psf-corr"))
 
             if "--fix-eps" in flags:
                 self.fix_eps_cb.setChecked(True)
@@ -1924,6 +1960,17 @@ class DensityGUI(QMainWindow):
             if "--gaussian-prior-rchi2-tol"     in flags: self.gp_rchi2_tol.setValue(flt("--gaussian-prior-rchi2-tol",     self.gp_rchi2_tol.value()))
             if "--gaussian-prior-scale"          in flags: self.gp_scale.setValue(flt("--gaussian-prior-scale",              self.gp_scale.value()))
             if "--gaussian-prior-max-frac-bound" in flags: self.gp_max_frac_bnd.setValue(flt("--gaussian-prior-max-frac-bound", self.gp_max_frac_bnd.value()))
+
+            # Ghirardini+2019 priors
+            if "--eps-prior-nsigma" in flags:
+                self.eps_prior_nsigma.setValue(flt("--eps-prior-nsigma", 1.0))
+            else:
+                self.eps_prior_nsigma.setValue(1.0)
+            if "--rs-prior-nsigma" in flags:
+                self.rs_prior_nsigma_cb.setChecked(True)
+                self.rs_prior_nsigma.setValue(flt("--rs-prior-nsigma", 1.0))
+            else:
+                self.rs_prior_nsigma_cb.setChecked(False)
 
             self._toggle_lsq_sub()
             self._toggle_prior_sub()
@@ -2000,6 +2047,7 @@ class DensityGUI(QMainWindow):
             "nburn":         self.nburn.value(),
             "fit_bkg":       self.fit_bkg.isChecked(),
             "full_vikhlinin":self.full_vikhlinin.isChecked(),
+            "psf_corr":      self.psf_corr.isChecked(),
             "lsq_init":      self.lsq_init.isChecked(),
             "lsq_smart_init":self.lsq_smart_init.isChecked(),
             "lsq_only":      self.lsq_only.isChecked(),
@@ -2016,6 +2064,9 @@ class DensityGUI(QMainWindow):
             "fix_eps_cb":    self.fix_eps_cb.isChecked(),
             "fix_eps":       self.fix_eps.value(),
             "fix_after_lsq": self.fix_after_lsq.text(),
+            "eps_prior_nsigma":  self.eps_prior_nsigma.value(),
+            "rs_prior_nsigma_cb":self.rs_prior_nsigma_cb.isChecked(),
+            "rs_prior_nsigma":   self.rs_prior_nsigma.value(),
         }
 
     def _apply_state(self, s: dict):
@@ -2034,6 +2085,7 @@ class DensityGUI(QMainWindow):
         self.nburn.setValue(s.get("nburn", 0))
         self.fit_bkg.setChecked(s.get("fit_bkg", False))
         self.full_vikhlinin.setChecked(s.get("full_vikhlinin", False))
+        self.psf_corr.setChecked(s.get("psf_corr", False))
         self.lsq_init.setChecked(s.get("lsq_init", False))
         self.lsq_smart_init.setChecked(s.get("lsq_smart_init", False))
         self.lsq_only.setChecked(s.get("lsq_only", False))
@@ -2050,6 +2102,9 @@ class DensityGUI(QMainWindow):
         self.fix_eps_cb.setChecked(s.get("fix_eps_cb", False))
         self.fix_eps.setValue(s.get("fix_eps", 0.0))
         self.fix_after_lsq.setText(s.get("fix_after_lsq", ""))
+        self.eps_prior_nsigma.setValue(s.get("eps_prior_nsigma", 1.0))
+        self.rs_prior_nsigma_cb.setChecked(s.get("rs_prior_nsigma_cb", False))
+        self.rs_prior_nsigma.setValue(s.get("rs_prior_nsigma", 1.0))
 
     def _load_presets_file(self):
         self._presets: dict = {}
