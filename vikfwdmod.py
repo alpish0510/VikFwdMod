@@ -1512,10 +1512,20 @@ class DensityGUI(QMainWindow):
             ll = _label(lbl); lay.addWidget(ll, r, 0); lay.addWidget(w, r, 1)
             self._lsq_sub_widgets.extend([ll, w])
 
+        self.lsq_window     = dbl2(0.5)
+        self.lsq_window_rs  = dbl2(0.5)
+
         lay.addWidget(self.lsq_tighten_all, 8, 0, 1, 2)
         ll2 = _label("window-all"); lay.addWidget(ll2, 9, 0)
         lay.addWidget(self.lsq_window_all, 9, 1)
-        self._lsq_sub_widgets.extend([self.lsq_tighten_all, ll2, self.lsq_window_all])
+        ll3 = _label("window"); lay.addWidget(ll3, 10, 0)
+        lay.addWidget(self.lsq_window, 10, 1)
+        ll4 = _label("window-rs"); lay.addWidget(ll4, 11, 0)
+        lay.addWidget(self.lsq_window_rs, 11, 1)
+        self._lsq_sub_widgets.extend([
+            self.lsq_tighten_all, ll2, self.lsq_window_all,
+            ll3, self.lsq_window, ll4, self.lsq_window_rs,
+        ])
 
         self._toggle_lsq_sub()
         return box
@@ -1597,15 +1607,24 @@ class DensityGUI(QMainWindow):
         self.fit_bkg          = QCheckBox("--fit-bkg  (background as free parameter)")
         self.full_vikhlinin   = QCheckBox("--full-vikhlinin-em  (second β component)")
         self.psf_corr         = QCheckBox("--psf-corr  (Churazov+2023 analytical PSF)")
+        self.use_S_param      = QCheckBox("--use-S-param  (S = 6β+ε reparameterization)")
+        self.use_S_param.setToolTip(
+            "Sample S = 6·beta + eps instead of eps directly.\n"
+            "Enforces hard priors: 0 ≤ eps ≤ 5, 0.1 ≤ beta ≤ 1.0.\n"
+            "Incompatible with --fix-eps (ignored by script when both set)."
+        )
         self.fit_bkg.stateChanged.connect(self._update_preview)
         self.full_vikhlinin.stateChanged.connect(self._update_preview)
         self.psf_corr.stateChanged.connect(self._update_preview)
+        self.use_S_param.stateChanged.connect(self._update_preview)
+        self.use_S_param.stateChanged.connect(self._validate)
 
         self.fix_eps = _DoubleSpinBox()
         self.fix_eps.setDecimals(4); self.fix_eps.setRange(-1e6, 1e6); self.fix_eps.setValue(0)
         self.fix_eps_cb = QCheckBox("--fix-eps")
         self.fix_eps_cb.stateChanged.connect(self._update_preview)
         self.fix_eps_cb.stateChanged.connect(lambda s: self.fix_eps.setEnabled(bool(s)))
+        self.fix_eps_cb.stateChanged.connect(self._validate)
         self.fix_eps.setEnabled(False)
         self.fix_eps.valueChanged.connect(self._update_preview)
 
@@ -1616,10 +1635,11 @@ class DensityGUI(QMainWindow):
         lay.addWidget(self.fit_bkg,        0, 0, 1, 2)
         lay.addWidget(self.full_vikhlinin, 1, 0, 1, 2)
         lay.addWidget(self.psf_corr,       2, 0, 1, 2)
-        lay.addWidget(self.fix_eps_cb,     3, 0)
-        lay.addWidget(self.fix_eps,        3, 1)
-        lay.addWidget(_label("fix-after-lsq"), 4, 0)
-        lay.addWidget(self.fix_after_lsq,  4, 1)
+        lay.addWidget(self.use_S_param,    3, 0, 1, 2)
+        lay.addWidget(self.fix_eps_cb,     4, 0)
+        lay.addWidget(self.fix_eps,        4, 1)
+        lay.addWidget(_label("fix-after-lsq"), 5, 0)
+        lay.addWidget(self.fix_after_lsq,  5, 1)
         return box
 
     # ── Preset bar ──
@@ -1820,12 +1840,19 @@ class DensityGUI(QMainWindow):
             if self.lsq_tighten_all.isChecked():
                 add("--lsq-tighten-all")
                 add("--lsq-window-all", f"{self.lsq_window_all.value():.2f}")
+            if abs(self.lsq_window.value() - 0.5) > 1e-9:
+                add("--lsq-window", f"{self.lsq_window.value():.2f}")
+            if abs(self.lsq_window_rs.value() - 0.5) > 1e-9:
+                add("--lsq-window-rs", f"{self.lsq_window_rs.value():.2f}")
 
         if self.gaussian_prior.isChecked():
             add("--gaussian-prior")
             add("--gaussian-prior-rchi2-tol",    f"{self.gp_rchi2_tol.value():.2f}")
             add("--gaussian-prior-scale",         f"{self.gp_scale.value():.3f}")
             add("--gaussian-prior-max-frac-bound",f"{self.gp_max_frac_bnd.value():.3f}")
+
+        if self.use_S_param.isChecked():
+            add("--use-S-param")
 
         if self.fix_eps_cb.isChecked():
             add("--fix-eps", f"{self.fix_eps.value():.4g}")
@@ -1932,6 +1959,7 @@ class DensityGUI(QMainWindow):
             self.fit_bkg.setChecked(checked("--fit-bkg"))
             self.full_vikhlinin.setChecked(checked("--full-vikhlinin-em"))
             self.psf_corr.setChecked(checked("--psf-corr"))
+            self.use_S_param.setChecked(checked("--use-S-param"))
 
             if "--fix-eps" in flags:
                 self.fix_eps_cb.setChecked(True)
@@ -1954,6 +1982,10 @@ class DensityGUI(QMainWindow):
             if "--lsq-max-nfev" in flags: self.lsq_max_nfev.setValue(intt("--lsq-max-nfev", self.lsq_max_nfev.value()))
             self.lsq_tighten_all.setChecked(checked("--lsq-tighten-all"))
             if "--lsq-window-all" in flags: self.lsq_window_all.setValue(flt("--lsq-window-all", self.lsq_window_all.value()))
+            if "--lsq-window"     in flags: self.lsq_window.setValue(flt("--lsq-window",         0.5))
+            else:                           self.lsq_window.setValue(0.5)
+            if "--lsq-window-rs"  in flags: self.lsq_window_rs.setValue(flt("--lsq-window-rs",   0.5))
+            else:                           self.lsq_window_rs.setValue(0.5)
 
             # Gaussian priors
             self.gaussian_prior.setChecked(checked("--gaussian-prior"))
@@ -1995,6 +2027,9 @@ class DensityGUI(QMainWindow):
 
         if self.gaussian_prior.isChecked() and not (self.lsq_init.isChecked() or self.lsq_smart_init.isChecked()):
             errors.append("gaussian-prior requires lsq-init or lsq-smart-init")
+
+        if self.use_S_param.isChecked() and self.fix_eps_cb.isChecked():
+            errors.append("--use-S-param and --fix-eps are incompatible (script ignores --fix-eps when both set)")
 
         if errors:
             self.validation_lbl.setObjectName("status_err")
@@ -2057,10 +2092,13 @@ class DensityGUI(QMainWindow):
             "lsq_max_nfev":  self.lsq_max_nfev.value(),
             "lsq_tighten_all":self.lsq_tighten_all.isChecked(),
             "lsq_window_all":self.lsq_window_all.value(),
+            "lsq_window":    self.lsq_window.value(),
+            "lsq_window_rs": self.lsq_window_rs.value(),
             "gaussian_prior":self.gaussian_prior.isChecked(),
             "gp_rchi2_tol":  self.gp_rchi2_tol.value(),
             "gp_scale":      self.gp_scale.value(),
             "gp_max_frac_bnd":self.gp_max_frac_bnd.value(),
+            "use_S_param":   self.use_S_param.isChecked(),
             "fix_eps_cb":    self.fix_eps_cb.isChecked(),
             "fix_eps":       self.fix_eps.value(),
             "fix_after_lsq": self.fix_after_lsq.text(),
@@ -2095,10 +2133,13 @@ class DensityGUI(QMainWindow):
         self.lsq_max_nfev.setValue(s.get("lsq_max_nfev", 500))
         self.lsq_tighten_all.setChecked(s.get("lsq_tighten_all", False))
         self.lsq_window_all.setValue(s.get("lsq_window_all", 0.5))
+        self.lsq_window.setValue(s.get("lsq_window", 0.5))
+        self.lsq_window_rs.setValue(s.get("lsq_window_rs", 0.5))
         self.gaussian_prior.setChecked(s.get("gaussian_prior", False))
         self.gp_rchi2_tol.setValue(s.get("gp_rchi2_tol", 1.5))
         self.gp_scale.setValue(s.get("gp_scale", 0.3))
         self.gp_max_frac_bnd.setValue(s.get("gp_max_frac_bnd", 0.25))
+        self.use_S_param.setChecked(s.get("use_S_param", False))
         self.fix_eps_cb.setChecked(s.get("fix_eps_cb", False))
         self.fix_eps.setValue(s.get("fix_eps", 0.0))
         self.fix_after_lsq.setText(s.get("fix_after_lsq", ""))
